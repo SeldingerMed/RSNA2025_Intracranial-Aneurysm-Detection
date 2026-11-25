@@ -60,8 +60,13 @@ class nnXNetPredictor(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
+            # Seldinger fork: load tensors and plain data only. The published checkpoint needs
+            # nothing but these NumPy types, so a tampered file cannot run code on load.
+            with torch.serialization.safe_globals([np.dtype, np._core.multiarray.scalar,
+                                                   np.dtypes.Float64DType, np.dtypes.Float32DType,
+                                                   np.dtypes.Int64DType]):
+                checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
+                                        map_location=torch.device('cpu'), weights_only=True)
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
                 configuration_name = checkpoint['init_args']['configuration']
@@ -73,21 +78,38 @@ class nnXNetPredictor(object):
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnxnet.__path__[0], "training", "nnXNetTrainer"),
-                                                    trainer_name, 'nnxnet.training.nnXNetTrainer')
-        
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnxnet.training.nnXNetTrainer. '
-                               f'Please place it there (in any .py file)!')
+        if trainer_name == 'nnUNetTrainer':
+            # Seldinger fork: the published stage 1 (vessel box) model was trained with stock
+            # nnU-Net, whose trainer class is not part of this package, and trainer discovery
+            # imports every trainer module, one of which needs a network file that was never
+            # published. The stock trainer builds its network straight from the plans, so do
+            # exactly that here.
+            from nnxnet.utilities.get_network_from_plans import get_network_from_plans
+            network = get_network_from_plans(
+                configuration_manager.network_arch_class_name,
+                configuration_manager.network_arch_init_kwargs,
+                configuration_manager.network_arch_init_kwargs_req_import,
+                num_input_channels,
+                plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+                allow_init=True,
+                deep_supervision=False
+            )
+        else:
+            trainer_class = recursive_find_python_class(join(nnxnet.__path__[0], "training", "nnXNetTrainer"),
+                                                        trainer_name, 'nnxnet.training.nnXNetTrainer')
 
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
-        )
+            if trainer_class is None:
+                raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnxnet.training.nnXNetTrainer. '
+                                   f'Please place it there (in any .py file)!')
+
+            network = trainer_class.build_network_architecture(
+                configuration_manager.network_arch_class_name,
+                configuration_manager.network_arch_init_kwargs,
+                configuration_manager.network_arch_init_kwargs_req_import,
+                num_input_channels,
+                plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+                enable_deep_supervision=False
+            )
 
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
